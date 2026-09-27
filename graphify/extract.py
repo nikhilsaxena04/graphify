@@ -3621,42 +3621,38 @@ UNRESOLVED_CALLS_KEY = "unresolved_calls"
 _MAX_PARKED_CALLS_PER_NODE = 64
 
 
-def _park_unresolved_member_call(
+def _record_unresolved_call(
     caller_node: dict | None,
+    *,
     callee: str,
-    receiver_type: str,
     lang: str,
+    reason: str,
     raw_call: dict,
+    receiver_type: str | None = None,
 ) -> None:
-    """Keep a member call whose receiver type is declared nowhere in this corpus.
-
-    A single-repo build can only bind ``obj.method()`` when the receiver's type is
-    declared in the same build, so a call into another repository is dropped with
-    the receiver type already in hand and nothing about it reaches ``graph.json``
-    — the one artifact ``merge-graphs`` and ``global add`` consume. Parking the
-    pair on the caller node lets a merged graph finish the edge (#3152).
-
-    The payload carries names only, never node ids: ids are rewritten by the
-    remaps and again by the repo prefixing, and a stale id inside metadata would
-    fail silently (#3150 was that bug). Names survive every rewrite.
-    """
-    if not caller_node or not callee or not receiver_type:
+    if not caller_node or not callee:
         return
     metadata = caller_node.setdefault("metadata", {})
     if not isinstance(metadata, dict):
         return
     parked = metadata.setdefault(UNRESOLVED_CALLS_KEY, [])
-    if not isinstance(parked, list) or len(parked) >= _MAX_PARKED_CALLS_PER_NODE:
+    if not isinstance(parked, list):
         return
-    callee, receiver_type = str(callee), str(receiver_type)
+    if len(parked) >= _MAX_PARKED_CALLS_PER_NODE:
+        metadata["unresolved_calls_truncated"] = metadata.get("unresolved_calls_truncated", 0) + 1
+        return
+    callee = str(callee)
     for previous in parked:
         if (
             isinstance(previous, dict)
             and previous.get("callee") == callee
             and previous.get("receiver_type") == receiver_type
+            and previous.get("reason") == reason
         ):
             return
-    entry = {"callee": callee, "receiver_type": receiver_type, "lang": lang}
+    entry = {"callee": callee, "lang": lang, "reason": reason}
+    if receiver_type:
+        entry["receiver_type"] = str(receiver_type)
     location = raw_call.get("source_location")
     if location:
         entry["line"] = str(location)
@@ -3981,6 +3977,84 @@ def _resolve_python_member_calls(
                 continue
             _emit_call(caller, children[0], rc)
 
+
+def _resolve_php_member_calls(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    def _key(label: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9]+", "", str(label)).lower()
+
+    contained = {e.get("target") for e in all_edges if e.get("relation") == "contains"}
+    
+    type_def_nids: dict[str, list[str]] = {}
+    node_by_id: dict[str, dict] = {}
+    for n in all_nodes:
+        node_by_id[n.get("id")] = n
+        if n.get("source_file") and n.get("id") in contained and n.get("label"):
+            # PHP allows case-insensitive class lookups
+            type_def_nids.setdefault(_key(n["label"]), []).append(n["id"])
+
+    method_index: dict[tuple[str, str], str] = {}
+    for e in all_edges:
+        if e.get("relation") == "contains":
+            src = node_by_id.get(e.get("source"))
+            tgt = node_by_id.get(e.get("target"))
+            if src and tgt and tgt.get("label") and tgt.get("id"):
+                method_index[(src.get("id", ""), _key(tgt["label"]))] = tgt["id"]
+
+    for result in per_file:
+        for rc in result.get("raw_calls", []) or []:
+            if not rc.get("is_member_call"):
+                continue
+            receiver_type = rc.get("receiver_type")
+            callee_name = rc.get("callee")
+            if not receiver_type or not callee_name:
+                continue
+                
+            caller_nid = rc.get("caller_nid")
+            caller_node = node_by_id.get(caller_nid)
+
+            owner_nids = type_def_nids.get(_key(receiver_type))
+            if not owner_nids:
+                _record_unresolved_call(
+                    caller_node,
+                    callee=callee_name,
+                    lang="php",
+                    reason="external_unresolved",
+                    raw_call=rc,
+                    receiver_type=receiver_type,
+                )
+                continue
+
+            # Check if all matching types have this method
+            found_targets = []
+            for owner_nid in owner_nids:
+                target_nid = method_index.get((owner_nid, _key(callee_name)))
+                if target_nid:
+                    found_targets.append(target_nid)
+
+            if found_targets:
+                for target_nid in found_targets:
+                    all_edges.append({
+                        "source": caller_nid,
+                        "target": target_nid,
+                        "relation": "calls",
+                        "source_file": rc.get("source_file"),
+                        "source_location": rc.get("source_location"),
+                        "confidence": "INFERRED",
+                        "metadata": {"reason": "receiver_typed"},
+                    })
+            else:
+                _record_unresolved_call(
+                    caller_node,
+                    callee=callee_name,
+                    lang="php",
+                    reason="no_unique_target",
+                    raw_call=rc,
+                    receiver_type=receiver_type,
+                )
 
 def _resolve_typescript_member_calls(
     per_file: list[dict],
@@ -5477,6 +5551,9 @@ register_language_resolver(
 # graphify.ruby_resolution; registered here as a second consumer of the framework.
 register_language_resolver(
     LanguageResolver("ruby_member_calls", frozenset({".rb", ".rake"}), resolve_ruby_member_calls)
+)
+register_language_resolver(
+    LanguageResolver("php_member_calls", frozenset({".php"}), _resolve_php_member_calls)
 )
 register_language_resolver(
     LanguageResolver("typescript_member_calls", frozenset({".ts", ".tsx", ".mts", ".cts", ".js", ".jsx"}), _resolve_typescript_member_calls)

@@ -2008,6 +2008,61 @@ def _csharp_scoped_receiver_type(
     """
     if not table or not name:
         return None
+
+def _php_class_receiver_types(class_node, source: bytes) -> dict[str, str]:
+    types: dict[str, str] = {}
+    
+    def walk_for_props(n):
+        if n.type == "property_declaration":
+            type_node = None
+            for child in n.children:
+                if child.type in ("named_type", "primitive_type", "nullable_type", "union_type", "intersection_type"):
+                    type_node = child
+                    break
+            
+            if type_node:
+                refs = []
+                _php_collect_type_refs(type_node, source, False, refs)
+                if refs:
+                    prop_type = refs[0][0]
+                    for child in n.children:
+                        if child.type == "property_element":
+                            var_node = child.child_by_field_name("name")
+                            if var_node:
+                                name = _read_text(var_node, source)
+                                if name and name.startswith("$"): name = name[1:]
+                                types[name] = prop_type
+        
+        elif n.type == "method_declaration":
+            name_node = n.child_by_field_name("name")
+            if name_node and _read_text(name_node, source).lower() == "__construct":
+                params = n.child_by_field_name("parameters")
+                if params:
+                    for p in params.children:
+                        if p.type == "property_promotion_parameter":
+                            type_node = None
+                            for child in p.children:
+                                if child.type in ("named_type", "primitive_type", "nullable_type", "union_type", "intersection_type"):
+                                    type_node = child
+                                    break
+                            if type_node:
+                                refs = []
+                                _php_collect_type_refs(type_node, source, False, refs)
+                                if refs:
+                                    prop_type = refs[0][0]
+                                    var_node = p.child_by_field_name("name")
+                                    if var_node:
+                                        name = _read_text(var_node, source)
+                                        if name and name.startswith("$"): name = name[1:]
+                                        types[name] = prop_type
+                                        
+        for child in n.children:
+            if child.type not in ("class_declaration", "interface_declaration", "trait_declaration"):
+                walk_for_props(child)
+                
+    walk_for_props(class_node)
+    return types
+
     bindings, base = table
     candidates = [
         b for b in bindings.get(name, ())
@@ -3505,6 +3560,7 @@ def _lua_is_require_call(node, source: bytes) -> bool:
     return _read_text(name_node, source) == "require"
 
 _PHP_ROUTING_VERBS = frozenset({"get", "post", "put", "patch", "delete", "options", "any", "match", "map"})
+_PHP_BUILTINS = frozenset({"empty", "isset", "unset", "eval", "include", "include_once", "require", "require_once", "count", "strlen", "die", "exit"})
 
 def _php_get_route_name(closure_node, src: bytes) -> str | None:
     """Walk up the AST to extract grouped routing prefixes (#3409)."""
@@ -3724,7 +3780,9 @@ def _extract_generic(
     # Java receiver typing is method-scoped: current-class fields are shared,
     # while parameters and locals belong only to their declaring method.
     java_field_types: dict[str, dict[str, str]] = {}
+    php_field_types: dict[str, dict[str, str]] = {}
     java_method_scopes: dict[int, tuple[object, str]] = {}
+    php_method_scopes: dict[int, tuple[object, str]] = {}
     # C# receiver typing is method-scoped too (#2299): class fields/properties
     # are shared, parameters and locals belong only to their declaring method —
     # the old file-wide table let one method's untypable rebinding poison a
@@ -3948,6 +4006,8 @@ def _extract_generic(
                     ):
                         metadata["ruby_lookup_unsafe"] = True
             add_node(class_nid, class_name, line, metadata=metadata)
+            if config.ts_module == "tree_sitter_php":
+                php_field_types[class_nid] = _php_class_receiver_types(node, source)
             if config.ts_module == "tree_sitter_ruby" and metadata:
                 # Reopened declarations collapse onto the same file-local id;
                 # merge fail-closed markers that add_node intentionally skips.
@@ -5552,6 +5612,10 @@ def _extract_generic(
             if body:
                 if config.ts_module == "tree_sitter_java" and parent_class_nid:
                     java_method_scopes[id(body)] = (node, parent_class_nid)
+
+                if config.ts_module == "tree_sitter_php" and parent_class_nid:
+                    php_method_scopes[id(body)] = (node, parent_class_nid)
+
                 if config.ts_module == "tree_sitter_c_sharp" and parent_class_nid:
                     csharp_method_scopes[id(body)] = (node, parent_class_nid)
                 function_bodies.append((func_nid, body))
@@ -5887,6 +5951,11 @@ def _extract_generic(
         )
         for body_id, (method_node, class_nid) in csharp_method_scopes.items()
     }
+    php_receiver_types = {
+        body_id: _fields_up_chain(php_field_types, class_nid)
+        for body_id, (method_node, class_nid) in php_method_scopes.items()
+    }
+
 
     def _emit_indirect_by_name(ident_name: str, loc_node, scope_nid: str,
                                context: str) -> None:
@@ -6371,6 +6440,19 @@ def _extract_generic(
                     name_node = node.child_by_field_name("name")
                     if name_node:
                         callee_name = _read_text(name_node, source)
+                        
+                    obj = node.child_by_field_name("object")
+                    if obj is not None:
+                        if obj.type == "variable_name":
+                            member_receiver = _read_text(obj, source)
+                            if member_receiver and member_receiver.startswith("$"):
+                                member_receiver = member_receiver[1:]
+                        elif obj.type == "member_access_expression":
+                            # $this->emailSender
+                            inner_obj = obj.child_by_field_name("object")
+                            inner_name = obj.child_by_field_name("name")
+                            if inner_obj and inner_name and _read_text(inner_obj, source) == "$this":
+                                member_receiver = _read_text(inner_name, source)
             elif config.ts_module == "tree_sitter_cpp":
                 # C++: function field, then field_expression/qualified_identifier
                 func_node = node.child_by_field_name(config.call_function_field) if config.call_function_field else None
@@ -6639,6 +6721,13 @@ def _extract_generic(
                             rc_entry["receiver_type"] = ruby_var_types.get(
                                 caller_nid, {}
                             ).get(member_receiver)
+
+                        if config.ts_module == "tree_sitter_php":
+                            rc_entry["lang"] = "php"
+                            receiver_type = (receiver_types or {}).get(member_receiver or "")
+                            if receiver_type:
+                                rc_entry["receiver_type"] = receiver_type
+
                         # Tag the C++ raw_call's language so the cross-file C++ resolver
                         # claims it unambiguously: a `.h` file routes to extract_cpp or
                         # extract_objc by content, and both resolvers see `.h` in their
@@ -6966,7 +7055,7 @@ def _extract_generic(
     # Body ids are unique (one language per file), so the Java (flat) and C#
     # (scoped, #2472) per-method receiver tables merge without collision — the
     # stamp site branches on language to read the matching shape.
-    receiver_types_by_body = {**java_receiver_types, **csharp_receiver_types}
+    receiver_types_by_body = {**java_receiver_types, **csharp_receiver_types, **php_receiver_types}
     for caller_nid, body_node in function_bodies:
         walk_calls(
             body_node,
